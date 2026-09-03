@@ -53,18 +53,27 @@ macro_rules! impl_readable_complex_multi_byte {
                 type_desc: &PyValue,
                 len: usize,
             ) -> Result<Vec<Self>, ReadDataError> {
-                let mut out = vec![$zero; len];
-                let inner_slice = complex_slice_as_inner_slice_mut(&mut out);
-                match *type_desc {
-                    PyValue::String(ref s) if s == $little_desc => {
-                        reader.$inner_read_into::<LittleEndian>(inner_slice)?;
+                // `len` comes from the file and is untrusted; we read in
+                // bounded chunks so that the allocation tracks the data
+                // actually present in the file instead of being sized by the
+                // untrusted declared shape (CWE-770).
+                let mut out: Vec<Self> = Vec::new();
+                while out.len() < len {
+                    let mut chunk: Vec<Self> =
+                        vec![$zero; super::READ_CHUNK_LEN.min(len - out.len())];
+                    let inner_slice = complex_slice_as_inner_slice_mut(&mut chunk);
+                    match *type_desc {
+                        PyValue::String(ref s) if s == $little_desc => {
+                            reader.$inner_read_into::<LittleEndian>(inner_slice)?;
+                        }
+                        PyValue::String(ref s) if s == $big_desc => {
+                            reader.$inner_read_into::<BigEndian>(inner_slice)?;
+                        }
+                        ref other => {
+                            return Err(ReadDataError::WrongDescriptor(other.clone()));
+                        }
                     }
-                    PyValue::String(ref s) if s == $big_desc => {
-                        reader.$inner_read_into::<BigEndian>(inner_slice)?;
-                    }
-                    ref other => {
-                        return Err(ReadDataError::WrongDescriptor(other.clone()));
-                    }
+                    out.append(&mut chunk);
                 }
                 check_for_extra_bytes(&mut reader)?;
                 Ok(out)

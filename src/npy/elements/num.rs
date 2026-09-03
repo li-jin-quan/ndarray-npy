@@ -1,6 +1,6 @@
 //! Trait implementations for primitive numeric types.
 
-use super::{bytes_as_mut_slice, bytes_as_slice, check_for_extra_bytes};
+use super::{bytes_as_mut_slice, bytes_as_slice, check_for_extra_bytes, read_chunked};
 use crate::{ReadDataError, ReadableElement, ViewDataError, ViewElement, ViewMutElement};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use py_literal::Value as PyValue;
@@ -16,8 +16,12 @@ macro_rules! impl_readable_primitive_one_byte {
             ) -> Result<Vec<Self>, ReadDataError> {
                 match *type_desc {
                     PyValue::String(ref s) if $(s == $desc)||* => {
-                        let mut out = vec![$zero; len];
-                        reader.$read_into(&mut out)?;
+                        // `len` comes from the file and is untrusted; see the
+                        // docs of `read_chunked` for why we don't allocate
+                        // `len` elements up front.
+                        let out = read_chunked(&mut reader, len, $zero, |r, buf| {
+                            r.$read_into(buf)
+                        })?;
                         check_for_extra_bytes(&mut reader)?;
                         Ok(out)
                     }
@@ -81,17 +85,30 @@ macro_rules! impl_readable_primitive_multi_byte {
                 type_desc: &PyValue,
                 len: usize,
             ) -> Result<Vec<Self>, ReadDataError> {
-                let mut out = vec![$zero; len];
-                match *type_desc {
-                    PyValue::String(ref s) if s == $little_desc => {
-                        reader.$read_into::<LittleEndian>(&mut out)?;
-                    }
-                    PyValue::String(ref s) if s == $big_desc => {
-                        reader.$read_into::<BigEndian>(&mut out)?;
-                    }
-                    ref other => {
-                        return Err(ReadDataError::WrongDescriptor(other.clone()));
-                    }
+                // `len` comes from the file and is untrusted; see the docs of
+                // `read_chunked` for why we don't allocate `len` elements up
+                // front.
+                let mut out: Vec<Self> = Vec::new();
+                while out.len() < len {
+                    let remaining = len - out.len();
+                    let mut chunk = match *type_desc {
+                        PyValue::String(ref s) if s == $little_desc => read_chunked(
+                            &mut reader,
+                            super::READ_CHUNK_LEN.min(remaining),
+                            $zero,
+                            |r, buf| r.$read_into::<LittleEndian>(buf),
+                        )?,
+                        PyValue::String(ref s) if s == $big_desc => read_chunked(
+                            &mut reader,
+                            super::READ_CHUNK_LEN.min(remaining),
+                            $zero,
+                            |r, buf| r.$read_into::<BigEndian>(buf),
+                        )?,
+                        ref other => {
+                            return Err(ReadDataError::WrongDescriptor(other.clone()));
+                        }
+                    };
+                    out.append(&mut chunk);
                 }
                 check_for_extra_bytes(&mut reader)?;
                 Ok(out)

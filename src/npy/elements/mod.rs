@@ -18,6 +18,45 @@ fn check_for_extra_bytes<R: io::Read>(reader: &mut R) -> Result<(), ReadDataErro
     }
 }
 
+/// Number of elements to read per chunk in [`read_chunked`].
+const READ_CHUNK_LEN: usize = 4096;
+
+/// Reads exactly `len` elements from `reader` into a `Vec`, in bounded chunks.
+///
+/// The `len` argument is derived from the shape declared in the `.npy` file
+/// header, so it is untrusted. Allocating `len` elements up front would let a
+/// very small file trigger a huge allocation (CWE-770): for example, a
+/// 128-byte file declaring a shape of one trillion `f64` elements would ask
+/// for 8 TB of memory. Reading in bounded chunks keeps the allocation
+/// proportional to the data actually present in the file, so a truncated or
+/// malicious file fails fast with an `UnexpectedEof` I/O error instead of
+/// aborting the process.
+///
+/// The `read_chunk` callback must read exactly `buf.len()` elements from the
+/// reader, i.e. it must have `read_exact` semantics.
+fn read_chunked<T, R, F>(
+    reader: &mut R,
+    len: usize,
+    zero: T,
+    mut read_chunk: F,
+) -> Result<Vec<T>, io::Error>
+where
+    T: Clone,
+    R: io::Read,
+    F: FnMut(&mut R, &mut [T]) -> Result<(), io::Error>,
+{
+    let mut out: Vec<T> = Vec::new();
+    let mut chunk: Vec<T> = Vec::new();
+    while out.len() < len {
+        let n = READ_CHUNK_LEN.min(len - out.len());
+        chunk.clear();
+        chunk.resize(n, zero.clone());
+        read_chunk(reader, &mut chunk)?;
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 /// Returns `Ok(_)` iff a slice containing `bytes_len` bytes is the correct length to cast to
 /// a slice with element type `T` and length `len`.
 ///
