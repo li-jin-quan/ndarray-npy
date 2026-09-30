@@ -1,14 +1,24 @@
 //! Regression tests for allocations driven by untrusted values in the file.
 //!
 //! The header of an `.npy` file declares both the header length and the array
-//! shape. These values are controlled by whoever wrote the file, so they must
-//! not be used to size an allocation before checking that the file actually
-//! contains that much data. Otherwise, a very small file could trigger a huge
-//! allocation (CWE-770); when such an allocation fails, the process aborts.
+//! shape. These values are controlled by whoever wrote the file, so a very
+//! small file can ask for a very large amount of memory (CWE-770). When such an
+//! allocation fails, the default Rust behavior is to abort the process, which a
+//! caller has no way to intercept.
 //!
-//! These tests assert that the largest single allocation is bounded by the
-//! amount of data actually present in the file, rather than by the declared
-//! values.
+//! This crate limits that in two different ways, and this module checks both:
+//!
+//! * The header itself is read with a bounded `Read::take`, so the allocation
+//!   tracks the bytes actually present in the file rather than the declared
+//!   header length. This is asserted directly by tracking allocation sizes.
+//!
+//! * The data allocation is made with `Vec::try_reserve_exact`, so an
+//!   allocation the system cannot satisfy is returned to the caller as an error
+//!   instead of aborting. A huge allocation is still *attempted* (this is
+//!   deliberate — see the `# Panics` docs of `ReadNpyExt::read_npy`), so this
+//!   is asserted as "returns `Err`" rather than as a bound on the requested
+//!   size. Note that if this ever regresses to an abort, the whole test process
+//!   dies, which is itself the signal that the fix has been lost.
 //!
 //! Note: all the checks live in a single `#[test]` function because the
 //! allocation tracker is process-global, so the checks must not run
@@ -92,14 +102,11 @@ fn file_with_declared_shape(shape: &str) -> Vec<u8> {
     v
 }
 
-/// The declared header length and shape must not drive allocation.
-///
-/// The sizes below (64 MiB and 8,000,000 elements) are chosen to be large
-/// enough to detect the vulnerability but small enough that the allocation
-/// succeeds, so that a regression is reported as an assertion failure rather
-/// than as an aborted test process.
+/// The declared header length must not drive allocation, and a declared shape
+/// that cannot be allocated must be reported as an error rather than aborting
+/// the process.
 #[test]
-fn allocation_is_bounded_by_data_actually_present() {
+fn untrusted_len_does_not_abort_the_process() {
     // A file declaring a 64 MiB header, but containing only 8 bytes of it.
     let file = file_with_declared_header_len(64 * 1024 * 1024);
     reset_max_request();
@@ -113,21 +120,25 @@ fn allocation_is_bounded_by_data_actually_present() {
         max_request()
     );
 
-    // A file declaring 8,000,000 `f64`s (64 MB of data), but containing none.
-    let file = file_with_declared_shape("(8000000,)");
-    reset_max_request();
-    let res = Array1::<f64>::read_npy(Cursor::new(&file));
-    assert!(res.is_err(), "a truncated file should fail to parse");
-    assert!(
-        max_request() < 1024 * 1024,
-        "the declared shape should not drive allocation: a file of {} bytes \
-         caused a single allocation of {} bytes",
-        file.len(),
-        max_request()
-    );
+    // Files declaring shapes far larger than anything this machine can
+    // allocate. Each must come back as an error. The sizes are chosen so that
+    // they fail for a reason that does not depend on how much memory the test
+    // machine happens to have: the first is well beyond any real address space,
+    // the second overflows `usize` altogether once multiplied by the element
+    // size.
+    for shape in ["(1000000000000000,)", "(1000000000000000000000,)"] {
+        let file = file_with_declared_shape(shape);
+        reset_max_request();
+        let res = Array1::<f64>::read_npy(Cursor::new(&file));
+        assert!(
+            res.is_err(),
+            "a declared shape of {} should be reported as an error rather than \
+             aborting the process",
+            shape
+        );
+    }
 
-    // Sanity check: a well-formed file still round-trips, and its allocation is
-    // on the order of the real data size.
+    // Sanity check: a well-formed file still round-trips.
     let arr = Array1::<f64>::from_vec((0..1000).map(|i| i as f64).collect());
     let mut buf = Vec::new();
     arr.write_npy(&mut buf).unwrap();

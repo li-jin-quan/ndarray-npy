@@ -1,4 +1,4 @@
-use super::check_for_extra_bytes;
+use super::{check_for_extra_bytes, zeroed_vec_of_len};
 use crate::{ReadDataError, ReadableElement};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use num_complex_0_4::Complex;
@@ -53,15 +53,12 @@ macro_rules! impl_readable_complex_multi_byte {
                 type_desc: &PyValue,
                 len: usize,
             ) -> Result<Vec<Self>, ReadDataError> {
-                // `len` comes from the file and is untrusted; we read in
-                // bounded chunks so that the allocation tracks the data
-                // actually present in the file instead of being sized by the
-                // untrusted declared shape (CWE-770).
-                let mut out: Vec<Self> = Vec::new();
-                while out.len() < len {
-                    let mut chunk: Vec<Self> =
-                        vec![$zero; super::READ_CHUNK_LEN.min(len - out.len())];
-                    let inner_slice = complex_slice_as_inner_slice_mut(&mut chunk);
+                // `len` comes from the file and is untrusted; see the docs of
+                // `zeroed_vec_of_len` for why we don't build the `Vec` in the
+                // usual way.
+                let mut out: Vec<Self> = zeroed_vec_of_len(len, $zero)?;
+                {
+                    let inner_slice = complex_slice_as_inner_slice_mut(&mut out);
                     match *type_desc {
                         PyValue::String(ref s) if s == $little_desc => {
                             reader.$inner_read_into::<LittleEndian>(inner_slice)?;
@@ -73,7 +70,6 @@ macro_rules! impl_readable_complex_multi_byte {
                             return Err(ReadDataError::WrongDescriptor(other.clone()));
                         }
                     }
-                    out.append(&mut chunk);
                 }
                 check_for_extra_bytes(&mut reader)?;
                 Ok(out)
